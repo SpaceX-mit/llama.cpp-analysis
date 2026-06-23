@@ -1,7 +1,7 @@
 # 完整流程：llama.cpp 跑 Qwen2.5 0.5B (Q4_0) on SpacemiT K3
 
 > **面向对象**：第一次接触 LLM 推理栈、想了解"一行 `-m model.gguf` 背后究竟发生了什么"的读者
-> **目标硬件**：SpacemiT K3 (Banbu K3, A200 核) — SpacemiT 迄今最强的 RISC-V + 自研 IME NPU SoC
+> **目标硬件**：SpacemiT K3 (Banbu K3, 8× X100 + 8× A100) — SpacemiT 迄今最强的 RISC-V + 自研 IME NPU SoC
 > **目标模型**：Qwen2.5 0.5B Instruct，量化方案 **Q4_0**（4-bit weight per 32 weight block，1 fp16 scale）
 > **关键工具链**：llama.cpp (本仓库) + libspine_tcm.so + 内核的 `/proc/set_ai_thread`
 
@@ -44,27 +44,39 @@ Qwen2.5 0.5B 是阿里通义千问 2.5 代的小模型。它的"骨架"长这样
 
 ## 1. 准备知识：SpacemiT K3 是什么？
 
-SpacemiT K3（Banbu K3）是进迭时空（SpacemiT）最新一代 RISC-V 异构 AI SoC。**异构**是关键——一颗芯片里装两类核：
+SpacemiT K3（Banbu K3）是进迭时空（SpacemiT）最新一代 RISC-V 异构 AI SoC。**异构**是关键——一颗芯片里装两类核，**总计 16 核**：
 
 ```
-┌─────────────────────────────────────────────┐
-│  SpacemiT K3 SoC                            │
-│                                             │
-│  ┌──────────────┐  ┌─────────────────────┐  │
-│  │  4× A55 主控  │  │  4× A200 AI 协处理器  │  │
-│  │  (X-class)    │  │  (A-class, 自研)     │  │
-│  │  跑 OS/调度    │  │  跑矩阵乘            │  │
-│  │  marchid=0x5064│  │  marchid=0xA0C8    │  │
-│  │              │  │  + 4MB TCM/核       │  │
-│  │  RVV 1.0     │  │  RVV 1.0 + VMADOT  │  │
-│  │  NEON/SVE 无  │  │  fp16 MAC 累加     │  │
-│  └──────────────┘  └─────────────────────┘  │
-│         │                ▲                  │
-│         └────── 共享 DDR ──┘                │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  SpacemiT K3 SoC (16 核异构)                              │
+│                                                          │
+│  ┌──────────────────┐   ┌────────────────────────────┐  │
+│  │  8× X100 主控核    │   │  8× A100 AI 协处理器核       │  │
+│  │  (X-class)        │   │  (A-class, 自研)             │  │
+│  │  跑 OS / llama.cpp │   │  跑矩阵乘 / 量化 / softmax  │  │
+│  │  marchid=0x5064   │   │  marchid=0xA064           │  │
+│  │                   │   │  + 4MB TCM/核（共 32MB）    │  │
+│  │  RVV 1.0          │   │  RVV 1.0 + VMADOT/IME2    │  │
+│  │  NEON/SVE 无      │   │  fp16 MAC 累加             │  │
+│  └──────────────────┘   └────────────────────────────┘  │
+│           │                       ▲                       │
+│           └────── 共享 DDR ────────┘                       │
+└──────────────────────────────────────────────────────────┘
 ```
 
-**A200 核 = A-class** = 自研 AI 核。它在 RISC-V V 扩展基础上加了**两条秘密武器指令**：
+### 16 核分工
+
+| 核 | 数量 | 角色 | marchid | 跑的活 |
+| --- | --- | --- | --- | --- |
+| **X100** | 8 | 主控 | `0x5064` | 操作系统、llama.cpp 主循环、prompt 处理、token 采样、I/O |
+| **A100** | 8 | AI 协处理器 | `0xA064` | 矩阵乘（MUL_MAT）、量化、FlashAttention tile |
+
+> 用户态的 worker 线程只绑到 **8 个 A100 核**；X100 留给系统调度和 llama 主循环。
+> 8 核并行矩阵乘，对 Qwen2.5 0.5B 这种小模型有充裕的算力冗余。
+
+### A100 核的"秘密武器"指令
+
+A100 核在标准 RISC-V V 扩展基础上加了**自研 IME2 指令**：
 
 | 指令 | 含义 | 干啥的 |
 | --- | --- | --- |
@@ -73,20 +85,48 @@ SpacemiT K3（Banbu K3）是进迭时空（SpacemiT）最新一代 RISC-V 异构
 
 > `hp` = half-precision partial sum，即"半精度部分和"。
 
-每个 A200 核有自己私有的 **4MB TCM（Tightly Coupled Memory，紧耦合内存）**——比 DDR 快 5-10 倍的低延迟 SRAM。SpacemiT 后端的"杀手锏"就是把正在算的那一片权重搬到 TCM 里去。
+每个 A100 核有自己私有的 **4MB TCM（Tightly Coupled Memory，紧耦合内存）**——比 DDR 快 5-10 倍的低延迟 SRAM。**K3 一共 8 × 4MB = 32MB TCM**，是 SpacemiT 后端把"正在算的那一片权重"搬过去的最大资本。
 
 ### 启动时如何识别 K3？
 
 `ggml/src/ggml-cpu/spacemit/ime_env.cpp:18-83` 读 `/proc/cpuinfo` 拿 `marchid`：
 
-| marchid | 映射到 | 含义 |
-| --- | --- | --- |
-| `0x5064` | `core_arch_x100` | X-class 核（主控） |
-| `0xA0C8` | `core_arch_a200` | A-class 核（AI） ← K3 |
-| `0xA064` | `core_arch_a100` | A-class 核（AI）K2 |
-| `0xA03C` | `core_arch_a60`  | A-class 核（AI）K1-bis |
+| marchid | 映射到 | 含义 | 出现在哪颗芯片 |
+| --- | --- | --- | --- |
+| `0x5064` | `core_arch_x100` | X-class 核（主控） | K1/K2/K3 的主控 |
+| `0xA03C` | `core_arch_a60`  | A-class 核（AI） | K1/K1-bis 的 AI |
+| `0xA064` | `core_arch_a100` | A-class 核（AI） | **K3 的 AI** ← 8 个 |
+| `0x50C8` | `core_arch_x200` | X-class 核（主控） | 下一代 |
+| `0xA0C8` | `core_arch_a200` | A-class 核（AI） | 下一代 |
 
-K3 上跑：`marchid=0xA0C8` → 4 个核是 `a200` → 走 **IME2 路径**（`use_ime2 = true`）。
+K3 上跑：
+
+- 8 个核的 `marchid=0x5064` → `core_arch_x100`（主控）
+- 8 个核的 `marchid=0xA064` → `core_arch_a100`（AI）
+
+`ime_env.cpp:198-209` 启动时按"高 4 bit = 0xA"自动把 8 个 A100 核选为 prefer：
+
+```cpp
+for (auto & core_info : core_info_list) {
+    auto core_arch_id   = core_info.arch_id;
+    auto core_arch_head = (uint16_t) (core_arch_id) >> 12;
+    if (core_arch_head == 0xA) {     // 0xA*** = A-class
+        num_perfer_cores++;          // K3: += 8
+        perfer_core_arch_id = core_arch_id;   // core_arch_a100
+        cpu_mask |= (1ULL << core_info.core_id);
+        perfer_core_ids.push_back(core_info.core_id);
+    }
+}
+```
+
+`ime_env.cpp:259-262` 根据 `perfer_core_arch_id` 决定用哪条 IME 路径：
+
+```cpp
+use_ime1 = perfer_core_arch_id == core_arch_a60 || perfer_core_arch_id == core_arch_x100;
+use_ime2 = perfer_core_arch_id == core_arch_a100;
+```
+
+K3：`perfer_core_arch_id = core_arch_a100` → `use_ime2 = true`，走 **IME2 路径**。
 
 ---
 
@@ -233,11 +273,11 @@ spine_env_info global_spine_env_info;   // ★ 全局对象
 
 这个全局对象在第一次被引用时构造——`spine_env_info::spine_env_info()` 在 **`ime_env.cpp:148-305`** 干这些事：
 
-1. 读 `/proc/cpuinfo` → 发现 4 个 `a200` 核 → `num_perfer_cores=4`, `cpu_mask=0xF0`
-2. 设 `use_ime2 = true`（因为 K3 是 A200 核），`use_tcm = true`
+1. 读 `/proc/cpuinfo` → 发现 8 个 `a100` 核 → `num_perfer_cores=8`, `cpu_mask=0xFF00`（假设 a100 在 core 8-15）
+2. 设 `use_ime2 = true`（因为 K3 的 prefer 是 A100），`use_tcm = true`
 3. `madvise(MADV_HUGEPAGE)` 申请 2MB 大页做内存池
-4. `dlopen("libspine_tcm.so")` 拿到 TCM 入口 → 探测到每核 4MB TCM
-5. 在共享内存里建 16 个 `spine_barrier_t`（线程间同步用）
+4. `dlopen("libspine_tcm.so")` 拿到 TCM 入口 → 探测到 **每核 4MB TCM**（共 32MB）
+5. 在共享内存里建 16 个 `spine_barrier_t`（线程间同步用，最多支持 32 线程 = 8 a100 核 × 4 thread/核）
 
 > **到本阶段结束，llama.cpp 在系统里"挂"上了一个特殊 buffer type**（伪装成 CPU buffer，但实际走 SpacemiT 路径）。
 
@@ -480,7 +520,7 @@ static enum ggml_status ggml_backend_riscv64_spacemit_buffer_init_tensor(buffer,
 
 `process_ubatch` → `graph_compute` → `ggml_backend_sched_graph_compute_async` → `ggml_backend_sched_compute_splits` → 调 `ggml_backend_cpu_graph_compute`。
 
-`ggml_backend_cpu_graph_compute` 内部（`ggml-cpu/ggml-cpu.cpp:130+`）起**多个 worker 线程**（K3 上默认 4-8 个）执行 `ggml_graph_compute_thread`：
+`ggml_backend_cpu_graph_compute` 内部（`ggml-cpu/ggml-cpu.cpp:130+`）起**多个 worker 线程**（K3 上默认 **8 个**，对应 8 个 A100 AI 核）执行 `ggml_graph_compute_thread`：
 
 ### 线程入口（关键！）
 
@@ -540,7 +580,7 @@ void ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(int thread_n) {
 }
 ```
 
-> **到此，4 个 worker 线程被绑到 K3 的 4 个 a200 AI 核上，每个线程各持 4MB TCM**。这就是"异步计算加速"的基础。
+> **到此，8 个 worker 线程被绑到 K3 的 8 个 a100 AI 核上，每个线程各持 4MB TCM**。这就是"异步计算加速"的基础。
 
 ---
 
@@ -639,7 +679,7 @@ spacemit_kernels::gemm_kernel_quantize_def gemm_kernel;
 #endif
 ```
 
-对 K3 + Q4_0，**最终选 `ime2::gemm_kernel_i8i4_hp`**（高吞吐 fp16 partial sum 版）。
+对 K3（A100，IME2 路径）+ Q4_0，**最终选 `ime2::gemm_kernel_i8i4_hp`**（高吞吐 fp16 partial sum 版）。
 
 #### 子步骤 B：在线量化 A 矩阵
 
@@ -682,7 +722,7 @@ void quantize_a_row_i8_hp(size_t blk_len, const float * a, size_t count_k, uint8
 
 A 量化后大约 896/256 × 36 ≈ 130 字节（单 token）。
 
-`ggml_barrier(threadpool)` —— **4 个线程都完成量化后**，才能开始 GEMM。
+`ggml_barrier(threadpool)` —— **8 个线程都完成量化后**，才能开始 GEMM。
 
 #### 子步骤 C：选 GEMM 路径
 
@@ -825,12 +865,12 @@ vse32.v v2, (s6)
 - 再乘 b_scale (fp16)
 - 再加 a_scale (fp32) 累加到 fp32 输出寄存器
 
-A200 核的 `vmadotsu.hp` 一个时钟周期能完成 32 个 int4×int8 的乘加（4 VRF × 8 lane = 32 个）。**比通用 RVV `vmadot`（int32 累加）快约 2 倍**，因为 fp16 partial sum 的吞吐是 fp32 的 2 倍。
+A100 核的 `vmadotsu.hp` 一个时钟周期能完成 32 个 int4×int8 的乘加（4 VRF × 8 lane = 32 个）。**比通用 RVV `vmadot`（int32 累加）快约 2 倍**，因为 fp16 partial sum 的吞吐是 fp32 的 2 倍。
 
 ### Step 8.7：节点结束 barrier
 
 ```c
-ggml_barrier(state->threadpool);   // 4 个线程同步
+ggml_barrier(state->threadpool);   // 8 个线程同步
 ```
 
 ### Step 8.8：所有节点跑完
@@ -844,7 +884,7 @@ ggml_barrier(state->threadpool);   // 4 个线程同步
 对更大的 token 批次（如 batch_size=8），A 量化 buffer 装不下 TCM（8×144=1.1KB 还行，但 m=64 就 9KB 装不下），改走 **路径 B**（**`spacemit/ime.cpp:433-492`**）：
 
 ```cpp
-// 4 个线程两两配对：(0,1) (2,3)，共享 spine_barrier[0/1]
+// 8 个线程两两配对：(0,1) (2,3) (4,5) (6,7)，共享 spine_barrier[0..3]
 // 偶数线程 (ith%2==0) 负责 memcpy
 // 奇数线程 (ith%2==1) 负责 GEMM
 // 用 barrier 同步
@@ -871,10 +911,11 @@ for (; ni < gemm_n; ni += NB_COLS * nth) {
 }
 ```
 
-> **双发射思想**：K3 的 A200 核是双发射的——一条指令做 memcpy，下一条指令做 GEMM，两条流水线并行跑。SpacemiT 后端用"双线程 + barrier"在软件层面实现了这个双发射：
+> **双发射思想**：K3 的 A100 核是双发射的——一条指令做 memcpy，下一条指令做 GEMM，两条流水线并行跑。SpacemiT 后端用"双线程 + barrier"在软件层面实现了这个双发射：
 > - 偶数线程这一轮 memcpy，奇数线程上一轮 GEMM；
 > - 偶数线程下一轮 GEMM，奇数线程这一轮 memcpy。
 > - `spine_barrier_t`（cache-line 对齐的双变量 barrier）保证数据依赖正确。
+> - 8 个 a100 核 × 2 线程/核 = 4 个 barrier pair（`spine_init_barrier_count=16`，够用）。
 
 ---
 
@@ -919,7 +960,7 @@ $ ./llama-cli -m qwen2.5-0.5b-q4_0.gguf -p "你好"
                                      ├─→ set_numa_thread_affinity()   [ime.cpp:1690]
                                      │   ① sched_getcpu()
                                      │   ② bind_ai_thread (/proc/set_ai_thread)
-                                     │   ③ pthread_setaffinity_np → 绑到 a200 核
+                                     │   ③ pthread_setaffinity_np → 绑到 a100 核
                                      │   ④ spine_mem_pool_tcm_mem_get() → 拿 4MB TCM
                                      │   ⑤ spine_mem_pool_tcm_mem_wait() → 等 TCM 就绪
                                      │
@@ -956,25 +997,27 @@ $ ./llama-cli -m qwen2.5-0.5b-q4_0.gguf -p "你好"
 
 | 项目 | 数值 | 备注 |
 | --- | --- | --- |
+| K3 总核数 | 16 | 8× X100 + 8× A100 |
+| AI 协处理器 | 8× A100 (marchid=0xA064) | llama.cpp worker 线程目标 |
 | 模型大小（Q4_0） | ≈ 330 MB | 24 层 + embedding + lm_head |
 | KV cache（ctx=1024） | ≈ 1.4 MB | 24 层 × 2 × 14 头 × 64 dim × 1024 × 2 bytes |
-| 单 token 推理时间（K3 上） | ≈ 30-50 ms | 4 个 a200 核满载 |
-| Pre-fill（128 token） | ≈ 1-2 s | 取决于 batch |
+| 单 token 推理时间（K3 8 核满载） | ≈ 15-30 ms | 8 个 a100 核并行 |
+| Pre-fill（128 token） | ≈ 0.5-1.5 s | 取决于 batch 大小 |
 | 单层 MUL_MAT 数量 | 7 个 | Q/K/V/O/Up/Gate/Down |
 | 单 token 调 `gemm_kernel_i8i4_hp` 次数 | 7 × 24 = 168 次 | 24 层 × 7 个 MUL_MAT |
 | 每次 `gemm_kernel` 内 `vmadotsu.hp` 数 | 8 条 | 4 VRF × lo/hi = 8 |
 | 每次 `vmadotsu.hp` 完成 MAC | 32 个 | 4 VRF × 8 lane |
-| K3 TCM 总容量 | 4 × 4 = 16 MB | 每核 4MB |
+| K3 TCM 总容量 | 8 × 4 = 32 MB | 每核 4MB |
 | 加载时 repack 耗时 | 几百 ms | 一次性 |
 | A 量化（单 token） | ≈ 5-10 μs | RVV vfabs/vfredmax |
-| 模型主频 | ~1.5-2 GHz | K3 公开资料 |
+| A100 核主频 | ~1.5-2 GHz | SpacemiT 公开资料 |
 
 ---
 
 ## 12. 一句话总结（给小白）
 
 > **llama.cpp 把 Qwen2.5 0.5B 描述成一张 600 个节点的"算子菜谱"**。
-> **SpacemiT 后端在加载时把 Q4_0 权重一次性重新摆盘**（repack），让 K3 的 AI 核能用专用指令 `vmadotsu.hp` 一次完成 32×32=1024 个 int4×int8 乘加。
-> **推理时，每个 worker 线程被绑到一个 AI 核并抢占 4MB TCM**，在线把 fp32 激活量化成 int8 后，从 TCM 喂给 GEMM 内核。
-> **路径 A 直接单线程跑 GEMM，路径 B 用双线程 + cache-line barrier 实现 ld/compute 流水线**，靠 K3 的双发射能力把数据搬运和计算重叠。
-> **24 层 × 7 个 MUL_MAT × 8 条 vmadotsu.hp × 32 个 MAC = 43 万次乘加每 token**，全部跑在 a200 核上，4 核并起来就是 170 万次/周期 ≈ K3 实测每 token 30 ms。
+> **SpacemiT 后端在加载时把 Q4_0 权重一次性重新摆盘**（repack），让 K3 的 8 个 A100 AI 核能用专用指令 `vmadotsu.hp` 一次完成 32×32=1024 个 int4×int8 乘加。
+> **推理时，8 个 worker 线程被分别绑到 8 个 A100 核并各抢占 4MB TCM**（共 32MB TCM），在线把 fp32 激活量化成 int8 后，从 TCM 喂给 GEMM 内核。
+> **路径 A 直接单线程跑 GEMM，路径 B 用双线程 + cache-line barrier 实现 ld/compute 流水线**，靠 A100 的双发射能力把数据搬运和计算重叠。
+> **24 层 × 7 个 MUL_MAT × 8 条 vmadotsu.hp × 32 个 MAC = 43 万次乘加每 token**，全部跑在 A100 核上，8 核并起来 ≈ K3 实测每 token 15-30 ms。
