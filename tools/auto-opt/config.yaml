@@ -1,0 +1,219 @@
+# auto-opt configuration
+# 用法: cp config.example.yaml config.yaml && 编辑
+
+# =========================================================================
+# 模型路由 (Model Routing)
+# =========================================================================
+models:
+  # Tier 1: 国内便宜模型 - 用于简单任务（读代码、生成单文件 patch、profile 分析）
+  tier1:
+    - name: deepseek-coder
+      api_base: https://api.deepseek.com/v1
+      api_key_env: DEEPSEEK_API_KEY
+      model_id: deepseek-coder
+      max_tokens: 4096
+      temperature: 0.2
+      cost_per_1k_tokens: 0.0001  # USD, 用来统计
+      strengths: [code_read, simple_patch, profile_analysis]
+
+    - name: qwen-coder
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key_env: DASHSCOPE_API_KEY
+      model_id: qwen-coder-plus
+      max_tokens: 4096
+      temperature: 0.2
+      cost_per_1k_tokens: 0.0003
+      strengths: [code_read, profiling, chinese_friendly]
+
+  # Tier 2: 高级模型 - 用于复杂任务（多文件重构、kernel 优化、架构决策）
+  tier2:
+    - name: claude-sonnet
+      api_base: https://api.anthropic.com/v1
+      api_key_env: ANTHROPIC_API_KEY
+      model_id: claude-sonnet-4-5
+      max_tokens: 8192
+      temperature: 0.1
+      cost_per_1k_tokens: 0.003
+      strengths: [complex_refactor, kernel_opt, architecture, debug]
+
+    - name: gpt-4
+      api_base: https://api.openai.com/v1
+      api_key_env: OPENAI_API_KEY
+      model_id: gpt-4-turbo
+      max_tokens: 8192
+      temperature: 0.1
+      cost_per_1k_tokens: 0.01
+      strengths: [general, planning, analysis]
+
+# 模型升级触发条件（当符合时自动用 tier2，否则用 tier1）
+upgrade_triggers:
+  # 多文件改动（超过 3 个文件）
+  - condition: "files_changed > 3"
+    tier: tier2
+  # 涉及汇编/kernel
+  - condition: "contains_inline_asm == true"
+    tier: tier2
+  # 改动 > 100 行
+  - condition: "diff_lines > 100"
+    tier: tier2
+  # 涉及 K3 硬件特定 (TCM/IME)
+  - condition: "touches_tcm_or_ime == true"
+    tier: tier2
+  # 难度评级 >= 4
+  - condition: "estimated_difficulty >= 4"
+    tier: tier2
+
+# =========================================================================
+# 优化策略 (Optimization Strategies)
+# =========================================================================
+# 每条策略会被 agent loop 依次尝试
+strategies:
+  - id: thread_tuning
+    name: "Worker 线程数调优"
+    category: config
+    risk: low               # low / medium / high
+    expected_gain: "5-30%"  # 文档值，仅供参考
+    tier: 1                 # 默认用 tier1
+    test:
+      n_prompt: 512
+      n_gen: 128
+      threads: [1, 2, 4, 8, 16]
+      reps: 3
+    apply:
+      # 修改什么文件、用什么 patch
+      files: [common/arg.cpp]
+      method: env_var     # 通过环境变量生效（无需改代码）
+
+  - id: quant_select
+    name: "量化方案对比"
+    category: model
+    risk: low
+    expected_gain: "5-50%"
+    tier: 1
+    test:
+      quants: [Q4_0, Q5_0, Q5_1, Q5_K, Q4_K, Q8_0]
+      n_prompt: 512
+      n_gen: 128
+      threads: 8
+      reps: 3
+    apply:
+      files: []
+      method: download_gguf   # 下载不同量化版 GGUF
+
+  - id: mem_backend
+    name: "大页内存池后端"
+    category: system
+    risk: low
+    expected_gain: "5-15%"
+    tier: 1
+    test:
+      backends: [none, posix, hpage, hpage1g]
+      n_prompt: 512
+      n_gen: 128
+      threads: 8
+      reps: 3
+    apply:
+      method: env_var  # SPACEMIT_MEM_BACKEND=...
+
+  - id: tcm_size
+    name: "TCM 容量测试"
+    category: hardware
+    risk: low
+    expected_gain: "0-10%"
+    tier: 1
+    test:
+      # 通过 fake_tcm 模拟不同 TCM 大小
+      tcm_sizes: [1MB, 2MB, 4MB, 8MB]
+    apply:
+      method: rebuild
+
+  - id: compiler_pgo
+    name: "PGO 编译优化"
+    category: build
+    risk: medium
+    expected_gain: "3-8%"
+    tier: 2                # 涉及复杂 build script
+    test:
+      n_prompt: 512
+      n_gen: 128
+      threads: 8
+      reps: 5
+    apply:
+      files: [CMakeLists.txt]
+      method: code_patch
+
+  - id: gemm_path_forcing
+    name: "GEMM 路径强制"
+    category: kernel
+    risk: high
+    expected_gain: "5-15%"
+    tier: 2                # 涉及汇编
+    test:
+      paths: [A, B, C]
+    apply:
+      files: [ggml-cpu/spacemit/ime.cpp]
+      method: code_patch
+
+  - id: kv_cache_quant
+    name: "KV cache 量化"
+    category: kernel
+    risk: high
+    expected_gain: "10-20% (长 ctx)"
+    tier: 2
+    test:
+      kv_types: [F16, Q8_0, Q4_0]
+    apply:
+      files: [llama-kv-cache.cpp]
+      method: code_patch
+
+# =========================================================================
+# Benchmark 配置
+# =========================================================================
+benchmark:
+  binary: build/bin/llama-bench
+  model: models/qwen2.5-0.5b-instruct-q4_0.gguf
+  extra_args:
+    - -ngl
+    - "99"
+  default_reps: 3
+  warmup_runs: 1
+  timeout_seconds: 300
+  results_dir: results/auto-opt
+
+# =========================================================================
+# Git / 分支管理
+# =========================================================================
+git:
+  main_branch: main
+  opt_branch_prefix: opt/    # opt/thread-tuning-20250101-120000
+  auto_commit: true
+  commit_message_template: |
+    auto-opt({strategy_id}): {description}
+
+    Baseline: {baseline_metric}
+    New:      {new_metric}
+    Delta:    {delta_pct}%
+
+    Model tier: {tier}
+    Cost: ${cost}
+
+  auto_push: false  # 推到 opt/* branch 即可，不直接 push 远程
+  remote: origin
+
+# =========================================================================
+# Agent Loop 配置
+# =========================================================================
+loop:
+  max_iterations: 50              # 最多跑 50 个实验
+  max_duration_hours: 8           # 最多跑 8 小时
+  stop_on_regression_count: 3     # 连续 3 次回退就停
+  min_improvement_pct: 0.5        # < 0.5% 算"无意义改进"，跳过
+  experiment_cooldown_seconds: 5  # 每个实验之间 sleep 5s（散热）
+
+# =========================================================================
+# Knowledge Base
+# =========================================================================
+knowledge:
+  db_path: results/auto-opt/knowledge.db
+  embed_provider: local           # 暂不实现 embedding
+  search_top_k: 5
