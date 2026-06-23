@@ -1,0 +1,5 @@
+# Ignore the cloned upstream source - this repo only tracks analysis
+llama.cpp/
+*.tmp
+*.swp
+.DS_Store
